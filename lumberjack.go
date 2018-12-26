@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,6 +114,9 @@ type Logger struct {
 
 	millCh    chan bool
 	startMill sync.Once
+
+	logChan chan []byte
+	cnDrop  int64
 }
 
 var (
@@ -128,11 +132,65 @@ var (
 	megabyte = 1024 * 1024
 )
 
-// Write implements io.Writer.  If a write would cause the log file to be larger
+func NewLogger(filename string, maxSize, maxAge, maxBackups int, localTime, compress bool) *Logger {
+	l := &Logger{
+		Filename:   filename,
+		MaxSize:    maxSize,
+		MaxAge:     maxAge,
+		MaxBackups: maxBackups,
+		LocalTime:  localTime,
+		Compress:   compress,
+		logChan:    make(chan []byte, 1024*128),
+	}
+
+	go l.run()
+
+	return l
+}
+
+func (l *Logger) run() {
+	fun := "Logger.run --> "
+	ticker := time.NewTicker(time.Second * 30)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case log, ok := <-l.logChan:
+			if ok {
+				_, err := l.syncWrite(log)
+				if err != nil {
+					fmt.Printf("%s syncWrite err:%s, log:%s", fun, err, string(log))
+				}
+			} else {
+				fmt.Printf("%s logChan is close", fun)
+				return
+			}
+
+		case <-ticker.C:
+			cnDrop := atomic.SwapInt64(&l.cnDrop, 0)
+			if cnDrop > 0 {
+				fmt.Printf("%s drop log %d", fun, cnDrop)
+			}
+		}
+	}
+}
+
+func (l *Logger) Write(p []byte) (n int, err error) {
+
+	select {
+	case l.logChan <- p:
+	default:
+		atomic.AddInt64(&l.cnDrop, 1)
+	}
+
+	return len(p), nil
+}
+
+// syncWrite implements io.Writer.  If a write would cause the log file to be larger
 // than MaxSize, the file is closed, renamed to include a timestamp of the
 // current time, and a new log file is created using the original log file name.
 // If the length of the write is greater than MaxSize, an error is returned.
-func (l *Logger) Write(p []byte) (n int, err error) {
+func (l *Logger) syncWrite(p []byte) (n int, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
