@@ -117,6 +117,8 @@ type Logger struct {
 
 	logChan chan []byte
 	cnDrop  int64
+
+	pool *sync.Pool
 }
 
 var (
@@ -140,7 +142,12 @@ func NewLogger(filename string, maxSize, maxAge, maxBackups int, localTime, comp
 		MaxBackups: maxBackups,
 		LocalTime:  localTime,
 		Compress:   compress,
-		logChan:    make(chan []byte, 1024*128),
+		logChan:    make(chan []byte, 1024*64),
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, 1024)
+			},
+		},
 	}
 
 	go l.run()
@@ -155,12 +162,13 @@ func (l *Logger) run() {
 
 	for {
 		select {
-		case log, ok := <-l.logChan:
+		case buf, ok := <-l.logChan:
 			if ok {
-				_, err := l.syncWrite(log)
+				_, err := l.syncWrite(buf)
 				if err != nil {
-					fmt.Printf("%s syncWrite err:%s, log:%s", fun, err, string(log))
+					fmt.Printf("%s syncWrite err:%s, log:%s", fun, err, string(buf))
 				}
+				l.pool.Put(buf)
 			} else {
 				fmt.Printf("%s logChan is close", fun)
 				return
@@ -177,9 +185,14 @@ func (l *Logger) run() {
 
 func (l *Logger) Write(p []byte) (n int, err error) {
 
+	buf := l.pool.Get().([]byte)
+	buf = buf[:0]
+	buf = append(buf, p...)
+
 	select {
-	case l.logChan <- p:
+	case l.logChan <- buf:
 	default:
+		l.pool.Put(buf)
 		atomic.AddInt64(&l.cnDrop, 1)
 	}
 
